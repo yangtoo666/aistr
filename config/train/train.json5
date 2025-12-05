@@ -1,0 +1,145 @@
+{
+  "seed": 0,
+
+ "train_dataset":
+  {
+   "train_dir": "D:\\ygt\\min4s\\json\\tr",
+    "batch_size": 1,
+    "sample_rate": 8000,
+    "segment": -1,
+  },
+
+  "validation_dataset":
+  {
+    "validation_dir": "D:\\ygt\\min4s\\json\\cv",
+    "batch_size": 1,
+    "sample_rate": 8000,
+    "segment": -1,
+    "cv_max_len": 6,
+  },
+
+  "train_loader":
+  {
+   "batch_size": 1,
+   "shuffle": true,
+   "num_workers": 0,
+  },
+
+  "validation_loader":
+  {
+    "batch_size": 1,
+    "shuffle": true,
+    "num_workers": 0,
+  },
+
+
+  "model":
+  {
+    "type": "pinnconvtast",
+
+
+
+
+    "pinn":
+    {
+        "hidden_dim": 128,
+        "sample_rate": 8000,
+        "use_adaptive_alf": 'True',
+        "constraint_weight": 0.1
+    },
+
+
+    "gnnode":
+    {
+      "num_steps": 20,
+      "num_speakers": 2,
+    },
+
+    "Gnnnmfatt":
+    {
+
+      "out_channels": 64,
+      "in_channels": 256,
+      "graphdim": 24,
+      "upsampling_depth": 5,
+      "enc_kernel_size": 4,
+      "num_sources": 2,
+      "sample_rate": 8000,
+      "numblocks": 9,
+    }
+  },
+
+  "train":
+  {
+    "use_cuda": true,
+    "epochs": 50,
+    "half_lr": true,
+    "early_stop": true,
+    "max_norm": 5,
+  },
+
+  "optimizer":
+  {
+    "type": "nadam",
+
+    "adamw": {
+      "lr": 1e-4,
+      "weight_decay": 1e-4,
+      "beta1": 0.9,
+      "beta2": 0.999
+    },
+
+    "nadam":
+    {
+      "lr": 1e-4,
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "weight_decay": 5e-4,
+      "momentum_decay": 5e-3,
+
+    },
+
+    "sgd":
+    {
+      "lr": 0.125,
+      "momentum": 0.0,
+      "l2": 0.0,
+    },
+
+    "adam":
+    {
+      "lr": 0.0001,
+      "beta1": 0.9,
+      "beta2": 0.999
+    },
+
+    "sgdp":
+    {
+      "lr":0.1,
+      "weight_decay":1e-5,
+      "momentum":0.9,
+      "nesterov":true
+    },
+
+    "adamp":
+    {
+      "lr":0.0003,
+      "beta1":0.9,
+      "beta2":0.999,
+      "weight_decay":1e-4,
+    }
+  },
+
+  "save_load":
+  {
+    "save_folder": "./checkpoint/",
+    "checkpoint": true,
+    "continue_from": "",
+    "model_path": "final.path.tar",
+  },
+
+  "logging":
+  {
+    "print_freq": 1,
+  }
+}

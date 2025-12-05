@@ -1,31 +1,51 @@
-# -*- encoding: utf-8 -*-
+
+
 import os
 import time
+
 import torch
+# from Loss import Loss
 import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
 
-# 重命名导入模块
-from physical_constraints import AdaptiveGeometricRegularizer, ScaleTimeGeometricRegularizer, \
-    ScaleTimeHardConstraint, GeometricAwarePostProcessing
+from physical_constraints import AdaptivePhysicsRegularizer, PhysicsRegularizer, SpeechSeparationHardConstraint, \
+    PhysicsAwarePostProcessing
+
+
+# from Datasets import Datasets
+# from pytorch_lightning.core.lightning import LightningModule
 
 
 class ChannelWiseLayerNorm(nn.LayerNorm):
+    """
+    Channel wise layer normalization
+    """
+
     def __init__(self, *args, **kwargs):
         super(ChannelWiseLayerNorm, self).__init__(*args, **kwargs)
 
     def forward(self, x):
+        """
+        x: N x C x T
+        """
         if x.dim() != 3:
             raise RuntimeError("{} accept 3D tensor as input".format(
                 self.__name__))
+        # N x C x T => N x T x C
         x = torch.transpose(x, 1, 2)
+        # LN
         x = super().forward(x)
+        # N x C x T => N x T x C
         x = torch.transpose(x, 1, 2)
         return x
 
 
 class GlobalChannelLayerNorm(nn.Module):
+    """
+    Global channel layer normalization
+    """
+
     def __init__(self, dim, eps=1e-05, elementwise_affine=True):
         super(GlobalChannelLayerNorm, self).__init__()
         self.eps = eps
@@ -39,11 +59,16 @@ class GlobalChannelLayerNorm(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x):
+        """
+        x: N x C x T
+        """
         if x.dim() != 3:
             raise RuntimeError("{} accept 3D tensor as input".format(
                 self.__name__))
+        # N x 1 x 1
         mean = torch.mean(x, (1, 2), keepdim=True)
         var = torch.mean((x - mean)**2, (1, 2), keepdim=True)
+        # N x T x C
         if self.elementwise_affine:
             x = self.gamma * (x - mean) / \
                 torch.sqrt(var + self.eps) + self.beta
@@ -57,6 +82,10 @@ class GlobalChannelLayerNorm(nn.Module):
 
 
 def select_norm(norm, dim):
+    """
+    Build normalize layer
+    LN cost more memory than BN
+    """
     if norm not in ["cLN", "gLN", "BN"]:
         raise RuntimeError("Unsupported normalize layer: {}".format(norm))
     if norm == "cLN":
@@ -133,6 +162,7 @@ class Encoder(nn.Module):
             raise RuntimeError(
                 "{} accept 1/2D tensor as input, but got {:d}".format(
                     self.__name__, x.dim()))
+        # when inference, only one utt
         if x.dim() == 1:
             x = torch.unsqueeze(x, 0)
         if x.dim() == 2:
@@ -169,6 +199,7 @@ class ConvTasNet(nn.Module):
                  causal=False
                  ):
         super(ConvTasNet, self).__init__()
+        # -----------------------model-----------------------
         self.encoder = Encoder(1, N, B, L, norm)
         self.separation = Separation(B, H, P, norm, X, R)
         self.decoder = Decoder(H, 1, L)
@@ -195,17 +226,21 @@ class ConvTasNet(nn.Module):
         return s
 
 def check_parameters(net):
+    '''
+        Returns module parameters. Mb
+    '''
     parameters = sum(param.numel() for param in net.parameters())
     return parameters / 10**6
 
 
-class ConvTasNetWithGeometricRegularization(nn.Module):
+# model.py
+class ConvTasNetWithPhysicsRegularization(nn.Module):
     def __init__(self,
                  N=512, L=16, B=128, H=512, P=3, X=8, R=3,
                  norm="gLN", num_spks=2, activate="relu", causal=False,
-                 use_geometric_regularization=True,
-                 regularization_type="new"):  # "basic" or "adaptive" or "new"
-        super(ConvTasNetWithGeometricRegularization, self).__init__()
+                 use_physics_regularization=True,
+                 regularization_type="new"):  # "basic" or "adaptive"#!!!!!!1
+        super(ConvTasNetWithPhysicsRegularization, self).__init__()
 
         # 原有的ConvTasNet结构
         self.encoder = Encoder(1, N, B, L, norm)
@@ -221,20 +256,21 @@ class ConvTasNetWithGeometricRegularization(nn.Module):
         self.non_linear = supported_nonlinear[activate]
         self.num_spks = num_spks
 
-        # 几何正则化模块
-        self.use_geometric_regularization = use_geometric_regularization
+        # 物理正则化
+        self.use_physics_regularization = use_physics_regularization
         self.regularization_type = regularization_type
 
-        if self.use_geometric_regularization:
+        if self.use_physics_regularization:
             if regularization_type == "adaptive":
-                self.geometric_regularizer = AdaptiveGeometricRegularizer(sample_rate=8000)
+                self.physics_regularizer = AdaptivePhysicsRegularizer(sample_rate=8000)
             elif regularization_type == "new":
-                self.geometric_regularizer = GeometricAwarePostProcessing(sample_rate=8000, num_sources=2)
-            else:
-                self.geometric_regularizer = ScaleTimeGeometricRegularizer(sample_rate=8000)
+                self.physics_regularizer = PhysicsAwarePostProcessing(sample_rate=8000, num_sources=2)
 
-            # 几何正则化强度
-            self.geometric_regularization_lambda = nn.Parameter(torch.tensor(0.1))
+            else:
+                self.physics_regularizer = PhysicsRegularizer(sample_rate=8000)
+
+            # 正则化强度
+            self.regularization_lambda = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x):
         """标准前向传播 - 不包含正则化计算"""
@@ -248,30 +284,30 @@ class ConvTasNetWithGeometricRegularization(nn.Module):
 
         return separated_sources
 
-    def compute_geometric_regularization_loss(self, separated_sources, mix, data_loss=None):
-        """计算几何正则化损失 - 单独的方法"""
-        if not self.use_geometric_regularization:
-            return torch.tensor(0.0), separated_sources
+    def compute_regularization_loss(self, separated_sources, mix,data_loss=None):
+        """计算正则化损失 - 单独的方法"""
+        if not self.use_physics_regularization:
+            return torch.tensor(0.0)
 
+        # 获取模型参数
         model_params = list(self.parameters())
 
         if self.regularization_type == "adaptive" and data_loss is not None:
-            geometric_loss = self.geometric_regularizer(
+            regularization_loss = self.physics_regularizer(
                 model_params, separated_sources, data_loss
             )
-            constrained_sources = separated_sources
         elif self.regularization_type == "new" and data_loss is not None:
-            geometric_loss, constrained_sources = self.geometric_regularizer(
+            regularization_loss, constrained_sources = self.physics_regularizer(
                 separated_sources, mix, data_loss
             )
         else:
-            geometric_loss = self.geometric_regularizer(
+            regularization_loss = self.physics_regularizer(
                 model_params, separated_sources
             )
-            constrained_sources = separated_sources
-        
-        geometric_strength = torch.sigmoid(self.geometric_regularization_lambda) * 1e-4
-        return geometric_strength * geometric_loss, constrained_sources
+        regularization_strength = torch.sigmoid(self.regularization_lambda) * 1e-4
+        return regularization_strength * regularization_loss,constrained_sources
+        # 应用正则化强度
+        # return torch.exp(self.regularization_lambda) * regularization_loss
 
     @classmethod
     def load_model(cls, path):
@@ -281,27 +317,41 @@ class ConvTasNetWithGeometricRegularization(nn.Module):
 
     @classmethod
     def load_model_from_package(cls, package):
-        model = cls()
+        model = cls(
+
+        )
         model.load_state_dict(package['state_dict'])
         return model
 
     @staticmethod
     def serialize(model, optimizer, epoch, tr_loss=None, cv_loss=None):
         package = {
+            # 保存基础配置参数
+
+            # 保存当前模型状态
             'state_dict': model.state_dict(),
+
             'optim_dict': optimizer.state_dict(),
             'epoch': epoch
         }
+
+        # 可选训练状态保存
         if tr_loss is not None:
             package['tr_loss'] = tr_loss
             package['cv_loss'] = cv_loss
+
         return package
 
 if __name__ == "__main__":
     from thop import profile
-    model = ConvTasNet()
+    model=ConvTasNet()
     input_tensor = torch.randn(1, 16000)
     input_tensor = input_tensor.cuda()
     model = model.cuda()
-    out = model(input_tensor)
+    out=model(input_tensor)
     print(out.shape)
+    # macs, params = profile(model, inputs=(input_tensor,))
+    # gmacs = macs / (10 ** 9)
+    # print("GMACs:", gmacs)
+    # gflops = macs * 2 / 1e9  # 将GMAC转换为GFLOP
+    # print(f"GFLOPs: {gflops:.2f}")

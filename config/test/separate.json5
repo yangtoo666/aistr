@@ -1,0 +1,17 @@
+{
+  "model_path": "./checkpoint/final.path.tar",
+
+   "mix_dir": "D:\\ygt\\json\\mix",
+
+  "mix_json": "D:\\ygt\\json\\tt\\mix.json",
+
+  "out_dir": "./result",
+
+  "model": "TDANet",
+
+  "use_cuda": false,
+
+  "sample_rate": 8000,
+
+  "batch_size": 1,
+}

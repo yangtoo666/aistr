@@ -1,3 +1,4 @@
+import librosa
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,6 +10,7 @@ import random
 
 from sympy.geometry.entity import scale
 
+# from old.TRAIN_NO_EMA1 import permutation_invariant_loss
 
 
 
@@ -32,7 +34,7 @@ import numpy as np
 from torch.fft import fft, ifft, fftfreq
 
 
-def compute_adaptive_scales(fs, duration, freq_low=80, freq_high=2000, num_scales=50):
+def compute_adaptive_scales(fs, duration, freq_low=80, freq_high=4000, num_scales=50):
     """
     自适应计算小波尺度
     Args:
@@ -126,7 +128,7 @@ class VectorizedMorletCWT(torch.nn.Module):
         # 高斯包络
         gaussian = torch.exp(-0.5 * (omega - self.w0) ** 2)
 
-        # # 复数小波构造
+        # 复数小波构造
         # wavelet_fft[positive_mask] = (
         #         torch.pi ** (-0.25) *
         #         torch.sqrt(2 * np.pi * scales_expanded.expand_as(omega)[positive_mask]) *
@@ -150,7 +152,7 @@ class VectorizedMorletCWT(torch.nn.Module):
 
         # L1归一化
         norm_factors = torch.sqrt(scales) * (
-                    torch.tensor(torch.pi, dtype=torch.float32, device=device) ** 0.25) * torch.sqrt(
+                torch.tensor(torch.pi, dtype=torch.float32, device=device) ** 0.25) * torch.sqrt(
             torch.tensor(2.0, device=device))
         wavelet_fft = wavelet_fft / norm_factors.unsqueeze(1)  # [n_scales, new_length]
 
@@ -171,7 +173,7 @@ class VectorizedMorletCWT(torch.nn.Module):
 
 
 class OptimizedMorletCWTHelmholtzLoss(nn.Module):
-    def __init__(self, fs=8000, duration=2.0, freq_low=80, freq_high=2000, num_scales=50, c=343.0):
+    def __init__(self, fs=8000, duration=2.0, freq_low=80, freq_high=4000, num_scales=50, c=343.0):
         super().__init__()
 
         # 自适应计算尺度
@@ -179,9 +181,9 @@ class OptimizedMorletCWTHelmholtzLoss(nn.Module):
 
         self.cwt = VectorizedMorletCWT(scales, c, fs)
         self.c, self.fs, self.duration = c, fs, duration
-        # 保存频率范围参数
-        self.freq_low = freq_low
         self.freq_high = freq_high
+        self.freq_low = freq_low
+
         # 预计算中心频率和有效掩码
         scales_tensor = torch.tensor(scales)
         center_freqs = 5.0 * fs / (2 * np.pi * scales_tensor)
@@ -231,12 +233,15 @@ class OptimizedMorletCWTHelmholtzLoss(nn.Module):
         # 动态调整尺度（保持不变）
         actual_duration = T / self.fs
         # if abs(actual_duration - self.duration) > 0.1:
-        #     scales = compute_adaptive_scales(self.fs, actual_duration)
+        #     scales = compute_adaptive_scales(self.fs, actual_duration, self.freq_low, self.freq_high)
         #     self.cwt.scales_buffer = torch.tensor(scales, device=waveform.device)
         #     self.duration = actual_duration
-        #     # 更新有效掩码以匹配新的尺度
-        #     self.update_valid_mask(scales, waveform.device)
-        scales = compute_adaptive_scales(self.fs, actual_duration)
+        #
+        # # 计算小波系数（核心：保留系数供外部使用）
+        # coeffs = self.cwt(waveform)  # [B, n_scales, T] 复数
+        # valid_coeffs = coeffs[:, self.valid_mask_buffer, :]  # [B, n_valid, T]
+
+        scales = compute_adaptive_scales(self.fs, actual_duration, self.freq_low, self.freq_high)
 
         # 检查是否需要更新尺度（尺度数量或时长变化较大时）
         need_update = (
@@ -280,30 +285,32 @@ class OptimizedMorletCWTHelmholtzLoss(nn.Module):
 
 
 class HybridALFIntegrator(nn.Module):
-    def __init__(self, f_theta, alpha=0.2, delta_ratio=0.5, max_steps=5):
+    def __init__(self, f_theta, alpha=0.5, delta_ratio=0.5, max_steps=5):
         super().__init__()
         self.f_theta = f_theta
         self.alpha = alpha
         self.delta_ratio = delta_ratio
         self.max_steps = max_steps
 
-    def alf_step(self, z_in, v_in, t_in, dt,mix):
+    def alf_step(self, z_in, v_in, t_in, dt):
         # 使用你的中点法 + LFM 校正
+
         t_half = t_in + dt / 2
+
         z_half = z_in + v_in * (dt / 2)
-        v_half = self.f_theta(t_half, z_half,mix)
+        v_half = self.f_theta(t_half, z_half)
 
         # 局部流匹配校正
         delta = dt * self.delta_ratio
         z_future = z_in + delta * v_in
         t_future = t_in + delta
-        v_local = self.f_theta(t_future, z_future,mix)
+        v_local = self.f_theta(t_future, z_future)
         v_half = v_half + self.alpha * (v_local - v_half)
 
         z_out = z_in + (v_in + v_half) * (dt / 2)
         return z_out, v_half
 
-    def forward(self, z0, t0, T,mix):
+    def forward(self, z0, t0, T):
         # 使用我的多步策略
         z_cur, t_cur = z0, t0
         dt_total = T - t0
@@ -313,8 +320,8 @@ class HybridALFIntegrator(nn.Module):
             if t_cur >= T:
                 break
             dt = min(dt_step, T - t_cur)
-            v_cur = self.f_theta(t_cur, z_cur,mix)
-            z_cur, v_cur = self.alf_step(z_cur, v_cur, t_cur, dt,mix)
+            v_cur = self.f_theta(t_cur, z_cur)
+            z_cur, v_cur = self.alf_step(z_cur, v_cur, t_cur, dt)
             t_cur += dt
 
         return z_cur
@@ -438,6 +445,7 @@ class TimeDomainWaveEquationLoss(nn.Module):
             scales: 小波尺度 [n_scales]（与系数对应）
         """
         # 实部和虚部分开计算（小波系数为复数）
+        cwt_coeffs = cwt_coeffs / (cwt_coeffs.abs().mean() + 1e-8)
         coeffs_real = cwt_coeffs.real
         coeffs_imag = cwt_coeffs.imag
 
@@ -469,11 +477,11 @@ class TimeDomainWaveEquationLoss(nn.Module):
         return (torch.mean(residual_real **2) + torch.mean(residual_imag** 2)) / 2
 
 class PhysicsConstrainedODEFunction(nn.Module):
-    def __init__(self, base_ode_func, decoder, output_proj, helmholtz_pinn,
+    def __init__(self, base_ode_func,  output_proj, helmholtz_pinn,
                  fs=8000, duration=2.0, constraint_weight=0.1):
         super().__init__()
         self.base_ode_func = base_ode_func
-        self.decoder = decoder
+
         self.output_proj = output_proj
         self.helmholtz_pinn = helmholtz_pinn
         self.log_constraint_weight = nn.Parameter(torch.log(torch.tensor(constraint_weight)))
@@ -497,20 +505,20 @@ class PhysicsConstrainedODEFunction(nn.Module):
 
         self.wave_equation = TimeDomainWaveEquationLoss()
 
-    def decode_to_freq(self, h):
-        """从隐藏状态h解码到频域特征"""
-        # h形状: [batch, time, hidden_dim] 或 [batch, hidden_dim]
-        if len(h.shape) == 2:
-            # 单个时间步: [batch, hidden_dim] -> [batch, 1, hidden_dim]
-            h = h.unsqueeze(1)
-
-        decoded = self.decoder(h)  # 解码
-        freq_features = self.output_proj(decoded)  # 频域特征   [batch, time, freq*2]
-        # 如果输入是单个时间步，去掉时间维度
-        if freq_features.shape[1] == 1:
-            freq_features = freq_features.squeeze(1)  # [batch, freq*2]
-
-        return freq_features
+    # def decode_to_freq(self, h):
+    #     """从隐藏状态h解码到频域特征"""
+    #     # h形状: [batch, time, hidden_dim] 或 [batch, hidden_dim]
+    #     if len(h.shape) == 2:
+    #         # 单个时间步: [batch, hidden_dim] -> [batch, 1, hidden_dim]
+    #         h = h.unsqueeze(1)
+    #
+    #     decoded = self.decoder(h)  # 解码
+    #     freq_features = self.output_proj(decoded)  # 频域特征   [batch, time, freq*2]
+    #     # 如果输入是单个时间步，去掉时间维度
+    #     if freq_features.shape[1] == 1:
+    #         freq_features = freq_features.squeeze(1)  # [batch, freq*2]
+    #
+    #     return freq_features
 
     def to_complex_spectrum(self, freq_features):
         """将实部+虚部特征转换为复数频谱"""
@@ -563,7 +571,7 @@ class PhysicsConstrainedODEFunction(nn.Module):
         return mask1, mask2
 
 
-    def forward(self, t, h,mix):
+    def forward(self, t, h):
         base_dynamics = self.base_ode_func(t, h)
         return base_dynamics
 
@@ -574,10 +582,28 @@ class mulmlp1(nn.Module):
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim*2),
             nn.LayerNorm(hidden_dim*2),
-            nn.GELU(),
+            nn.Tanh(),
             nn.Dropout(0.1),
 
         )
+
+        self.mlp = nn.Sequential(
+            # nn.Linear(hidden_dim, hidden_dim * 2),
+            Lambda(lambda x: x.transpose(1, 2)),
+            nn.Conv1d(hidden_dim * 2, hidden_dim * 2, kernel_size=7, padding=3),
+
+            nn.Conv1d(hidden_dim * 2, hidden_dim * 2, kernel_size=5, padding=2),
+
+            nn.Conv1d(hidden_dim * 2, hidden_dim * 2, kernel_size=3, padding=1),
+
+            nn.Conv1d(hidden_dim * 2, hidden_dim * 2, kernel_size=1),
+            Lambda(lambda x: x.transpose(1, 2)),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Tanh(),
+            nn.Dropout(0.1),
+            # nn.Linear(hidden_dim * 2, hidden_dim)
+        )
+
 
         self.mlp0 = nn.Sequential(
             # nn.Linear(hidden_dim, hidden_dim * 2),
@@ -585,7 +611,7 @@ class mulmlp1(nn.Module):
             nn.Conv1d(hidden_dim * 2, hidden_dim * 2, kernel_size=7, padding=3),
             Lambda(lambda x: x.transpose(1, 2)),
             nn.LayerNorm(hidden_dim * 2),
-            nn.GELU(),
+            nn.Tanh(),
             nn.Dropout(0.1),
             # nn.Linear(hidden_dim * 2, hidden_dim)
         )
@@ -596,7 +622,7 @@ class mulmlp1(nn.Module):
             nn.Conv1d(hidden_dim* 2, hidden_dim * 2, kernel_size=5, padding=2),
             Lambda(lambda x: x.transpose(1, 2)),
             nn.LayerNorm(hidden_dim * 2),
-            nn.GELU(),
+            nn.Tanh(),
             nn.Dropout(0.1),
 
         )
@@ -607,7 +633,7 @@ class mulmlp1(nn.Module):
             nn.Conv1d(hidden_dim * 2, hidden_dim * 2, kernel_size=3, padding=1),
             Lambda(lambda x: x.transpose(1, 2)),
             nn.LayerNorm(hidden_dim * 2),
-            nn.GELU(),
+            nn.Tanh(),
             nn.Dropout(0.1),
             # nn.Linear(hidden_dim * 2, hidden_dim)
         )
@@ -618,7 +644,7 @@ class mulmlp1(nn.Module):
             nn.Conv1d(hidden_dim * 2, hidden_dim * 2, kernel_size=1),
             Lambda(lambda x: x.transpose(1, 2)),
             nn.LayerNorm(hidden_dim * 2),
-            nn.GELU(),
+            nn.Tanh(),
             nn.Dropout(0.1),
             # nn.Linear(hidden_dim * 2, hidden_dim)
         )
@@ -635,12 +661,12 @@ class mulmlp1(nn.Module):
     def forward(self, x):
         identity = x
         x = self.input_proj(x)
-
+        y = self.mlp(x)
         x0 = self.mlp0(x)
-        x1 = self.mlp1(x0)
-        x2 = self.mlp2(x1)
-        x3 = self.mlp3(x2)
-        x = x0 + x1 + x2 + x3
+        x1 = self.mlp1(x)
+        x2 = self.mlp2(x)
+        x3 = self.mlp3(x)
+        x = x0 + x1 + x2 + x3 + y
 
         x = self.output_proj(x)+self.residual_proj(identity)
         return x
@@ -672,7 +698,7 @@ class HelmholtzPINNODESeparator(nn.Module):
         self.encoder = mulmlp1(freq_dim * 2, hidden_dim, hidden_dim)
 
         # 解码器（增强版：深度+残差+LayerNorm）
-        self.decoder = mulmlp1(hidden_dim, hidden_dim, hidden_dim)
+        # self.decoder = mulmlp1(hidden_dim, hidden_dim, hidden_dim)
 
         # 输出投影层（增强版：捕捉高频特征交互）
         self.output_proj = mulmlp1(hidden_dim, hidden_dim, freq_dim * 4)
@@ -684,7 +710,7 @@ class HelmholtzPINNODESeparator(nn.Module):
 
         self.ode_func = PhysicsConstrainedODEFunction(
             base_ode_func=self.base_ode_func,
-            decoder=self.decoder,
+            # decoder=self.decoder,
             output_proj=self.output_proj,
             helmholtz_pinn=self.helmholtz_pinn,
             fs=sample_rate,
@@ -762,21 +788,21 @@ class HelmholtzPINNODESeparator(nn.Module):
         U_real = torch.view_as_real(U)
         U_flat = U_real.permute(0, 2, 1, 3).flatten(2)  # [batch, time, freq*2]
 
-        # 缓存频域特征供ODE使用（建立时间尺度联系）
-        self.ode_func.current_U_flat = U
+
 
         # 编码
         h0 = self.encoder(U_flat)  # [batch, time, hidden_dim]
-
+        # 缓存频域特征供ODE使用（建立时间尺度联系）
+        self.ode_func.current_h0 = h0
         # ODE演化（带物理约束）- 只使用一个ODE
-        if self.use_adaptive_alf:
-            t0, T = t_grid[0], t_grid[-1]
-            h_trajectory = self.alf_integrator(h0, t0, T,x_waveform)
+
+        t0, T = t_grid[0], t_grid[-1]
+        h_trajectory = self.alf_integrator(h0, t0, T)
 
 
         # 解码与掩码生成
-        decoded = self.decoder(h_trajectory)
-        freq_features = self.output_proj(decoded)  # [batch, time, freq*4]
+        # decoded = self.decoder(h_trajectory)
+        freq_features = self.output_proj(h_trajectory)  # [batch, time, freq*4]
 
         # 生成两个掩码
         mask1, mask2 = self.generate_masks(freq_features)
@@ -789,8 +815,7 @@ class HelmholtzPINNODESeparator(nn.Module):
         sep1 = self.helmholtz_pinn.istft(sep1_freq)[..., :orig_len]  # 裁剪到原始长度
         sep2 = self.helmholtz_pinn.istft(sep2_freq)[..., :orig_len]  # 裁剪到原始长度
 
-        # 清理缓存
-        self.ode_func.current_U_flat = None
+
 
         # 调整输出形状
         sep1 = sep1.unsqueeze(1)
@@ -865,8 +890,8 @@ class ChannelAttention(nn.Module):
 class ConcatChannels(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv5x5 = nn.Conv2d(1, 16, (5, 5), padding=2)  # 输入通道4，输出16
-        self.conv3x3 = nn.Conv2d(1, 16, (3, 3), padding=1)  # 输入通道4，输出16
+        self.conv5x5 = nn.Conv2d(4, 32, (5, 5), padding=2)  # 输入通道4，输出16
+        self.conv3x3 = nn.Conv2d(4, 32, (3, 3), padding=1)  # 输入通道4，输出16
 
     def forward(self, x):
         out5 = self.conv5x5(x)  # [B,16,F,T]
@@ -879,27 +904,31 @@ class ScoreEstimator(nn.Module):
         super().__init__()
 
         self.attention = nn.Sequential(
-            nn.Conv2d(1, 16, 1),  # 空间注意力
-            nn.ReLU(),
-            ChannelAttention(16),
-            nn.Conv2d(16, 1, 1),
+            nn.Conv2d(1, 32, (3, 3), padding=1),
+            nn.LeakyReLU(0.2),
+            ChannelAttention(32),
+            nn.Conv2d(32, 32, (1, 1)),
+            nn.LeakyReLU(0.2),
+            ChannelAttention(32),
+            nn.Conv2d(32, 4, (5, 5), padding=2),
             nn.Sigmoid()
         )
 
         # [B, 2*num_speakers, freq_bins, time_frames]
         self.net = nn.Sequential(
             ConcatChannels(),
-            nn.Conv2d(32, 32, (3, 3), padding=1),  # 保持[H,W]
+            nn.Conv2d(64, 64, (3, 3), padding=1),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(32, 32, (1, 1)),
+            nn.Conv2d(64, 64, (1, 1)),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(32, 1, (5, 5), padding=2)
+            nn.Conv2d(64, 1, (5, 5), padding=2)
         )
+
 
     def forward(self, t, input):
         attn_input = input.unsqueeze(1)
         spatial_attn = self.attention(attn_input)  # [B*C, 1, F, T]
-        attended = attn_input * spatial_attn + spatial_attn
+        attended = spatial_attn + attn_input
 
         base_out = self.net(attended).view(attn_input.shape) + attn_input
 
@@ -954,3 +983,30 @@ def si_snr_loss(pred, target):
     # 返回负SNR作为损失（因为我们要最小化损失）
     return -torch.mean(snr)
 
+if __name__ == '__main__':
+    def load_audio(audio_path, sample_rate=8000):
+        """加载音频文件"""
+        audio, _ = librosa.load(audio_path, sr=sample_rate)
+        return audio
+
+
+    # 加载音频
+
+    clean_audio = load_audio("C:\\Users\\杨二\\Downloads\\MicrosoftEdgeDropFiles\\Default\\61-70968-0001_3575-170457-0012.wav", sample_rate=8000)
+
+    # 转换为张量并添加批次和通道维度
+    sep1 = torch.from_numpy(clean_audio).float().unsqueeze(0).unsqueeze(1)
+
+
+
+    # 计算物理损失
+    model = HelmholtzPINNODESeparator(
+
+    )
+    freq_loss1, cwt1, scales1 = model.ode_func.helmholtz_loss(sep1.squeeze(1))
+    # freq_loss2, cwt2, scales2 = self.model.ode_func.helmholtz_loss(sep2.squeeze(1))
+    time_loss1 = model.ode_func.wave_equation(cwt1, scales1)
+    # time_loss2 = self.model.ode_func.wave_equation(cwt2, scales2)
+
+    print(f"第一个说话人 - 亥姆霍兹损失: {freq_loss1.item():.6f}")
+    print(f"第一个说话人 - 波动方程损失: {time_loss1.item():.6f}")
